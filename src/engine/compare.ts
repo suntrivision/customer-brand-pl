@@ -110,6 +110,94 @@ LABEL_TO_ID.set(normLabel("Gross Margin"), "gm-after-promoter");
 LABEL_TO_ID.set(normLabel("Operating Income before Tax"), "npbt");
 LABEL_TO_ID.set(normLabel("Net Operating Profit"), "nop");
 
+/** Fill rollup lines Trivision mapper often omits (G&A / Other Operating). */
+export function fillDerivedInput(input: ActualsInput): ActualsInput {
+  const out = { ...input };
+  const n = (id: string) => (out[id] != null && Number.isFinite(out[id]!) ? out[id]! : null);
+
+  if (n("ga") == null && n("staff") != null) out.ga = n("staff");
+
+  if (n("other-ga") == null) {
+    const parts = [n("finance"), n("admin"), n("outdoor")].filter((v): v is number => v != null);
+    if (parts.length) out["other-ga"] = parts.reduce((a, b) => a + b, 0);
+  }
+
+  if (n("other-op") == null) {
+    const parts = [n("other-exp"), n("other-inc")].filter((v): v is number => v != null);
+    if (parts.length) out["other-op"] = parts.reduce((a, b) => a + b, 0);
+  }
+
+  if (n("cogs") == null) {
+    const d = n("cogs-direct");
+    const i = n("cogs-indirect");
+    if (d != null || i != null) out.cogs = (d ?? 0) + (i ?? 0);
+  }
+
+  return out;
+}
+
+/**
+ * Map Trivision customer text (e.g. "DIST-CK DISTRIBUTORS — DTCK") onto
+ * a Local P&L channel name from the uploaded workbook.
+ */
+export function resolveCustomerChannel(
+  raw: string | null | undefined,
+  channels: string[],
+): string | null {
+  if (!raw) return null;
+  const text = raw.trim();
+  if (!text) return null;
+  if (channels.includes(text)) return text;
+
+  // "DIST-CK DISTRIBUTORS — DTCK" → try left of dash / emdash
+  const left = text.split(/\s*[—–-]\s*/)[0]?.trim() ?? text;
+  if (channels.includes(left)) return left;
+
+  const norm = normLabel(text);
+  const normLeft = normLabel(left);
+
+  // Exact normalized match
+  for (const ch of channels) {
+    const nc = normLabel(ch);
+    if (nc === norm || nc === normLeft) return ch;
+  }
+
+  // Channel contained in customer string (or reverse)
+  for (const ch of channels) {
+    const nc = normLabel(ch);
+    if (nc.length >= 4 && (norm.includes(nc) || normLeft.includes(nc))) return ch;
+  }
+
+  // Trailing customer code (DTCK) matching DIST-CK… style
+  const code = text.match(/\b([A-Z]{2,}[A-Z0-9]*)\s*$/i)?.[1];
+  if (code) {
+    const codeNorm = normLabel(code);
+    for (const ch of channels) {
+      const nc = normLabel(ch);
+      if (nc.includes(codeNorm) || nc.replace(/\s+/g, "").includes(codeNorm)) return ch;
+      // DTCK ↔ DIST-CK
+      if (codeNorm.startsWith("dt") && nc.includes(codeNorm.slice(2))) {
+        // weak; prefer DIST-CK when code is DTCK
+      }
+    }
+    if (/^dtck$/i.test(code)) {
+      const hit = channels.find((c) => /dist-ck/i.test(c));
+      if (hit) return hit;
+    }
+  }
+
+  return null;
+}
+
+export function isTrivisionMapperSheet(rows: (string | number | null | undefined)[][]): boolean {
+  let hits = 0;
+  for (const row of rows.slice(0, 40)) {
+    const b = String(row?.[1] ?? "").trim();
+    if (/^(base|calculated)$/i.test(b)) hits++;
+  }
+  return hits >= 3;
+}
+
 export function emptyActualsInput(): ActualsInput {
   const out: ActualsInput = {};
   for (const line of COMPARE_LINES) {
@@ -279,6 +367,78 @@ export function parseComparativeSheet(
   }
 
   return { input, matched, unmatched, detectedCustomer, sourceLabel };
+}
+
+/**
+ * Parse Trivision / P&L Mapper export (e.g. dtck.xlsx):
+ * Col A = line, Col B = base|calculated, Col C = brand desc,
+ * Col D = customer, Col E = amount.
+ */
+export function parseTrivisionMapperSheet(
+  rows: (string | number | null | undefined)[][],
+): {
+  input: ActualsInput;
+  matched: number;
+  unmatched: string[];
+  detectedCustomer: string | null;
+  sourceLabel: string;
+} {
+  const input = emptyActualsInput();
+  const unmatched: string[] = [];
+  let matched = 0;
+  let detectedCustomer: string | null = null;
+
+  for (const row of rows) {
+    if (!row?.length) continue;
+    const label = String(row[0] ?? "").trim();
+    if (!label || /^p&l line/i.test(label) || /^report$/i.test(label)) continue;
+
+    const kind = String(row[1] ?? "").trim();
+    // Prefer mapper rows; still accept label+amount if amount is in col E
+    let amount: number | null = null;
+    const e = Number(row[4]);
+    if (Number.isFinite(e)) {
+      amount = e;
+    } else {
+      // last numeric cell in the row
+      for (let i = row.length - 1; i >= 1; i--) {
+        const n = Number(row[i]);
+        if (Number.isFinite(n) && !/^(base|calculated)$/i.test(String(row[i]))) {
+          amount = n;
+          break;
+        }
+      }
+    }
+    if (amount == null || !Number.isFinite(amount)) continue;
+    if (kind && !/^(base|calculated)$/i.test(kind) && row[4] == null) {
+      // not a mapper row and no col E — skip noise
+      continue;
+    }
+
+    const cust = String(row[3] ?? "").trim();
+    if (cust && !detectedCustomer) detectedCustomer = cust;
+
+    const id = LABEL_TO_ID.get(normLabel(label));
+    if (!id) {
+      unmatched.push(label);
+      continue;
+    }
+    input[id] = amount;
+    matched++;
+  }
+
+  const filled = fillDerivedInput(input);
+  const sourceLabel = detectedCustomer
+    ? `Trivision · ${detectedCustomer}`
+    : "Trivision P&L";
+
+  return {
+    input: filled,
+    matched,
+    unmatched,
+    detectedCustomer,
+    sourceLabel,
+  };
 }
 
 export function buildCustomerCompare(

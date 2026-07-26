@@ -14,8 +14,33 @@ function val(v: number | null | undefined): string {
   });
 }
 
+function AllocationTrail({ metric }: { metric: MetricWorkings }) {
+  const steps = metric.allocationSteps ?? metric.spreadsheet?.allocationSteps;
+  if (!steps?.length) return null;
+
+  return (
+    <div className="alloc-trail">
+      <div className="ss-label">Actuals allocation / steps</div>
+      <ol className="alloc-steps">
+        {steps.map((s) => (
+          <li key={`${metric.title}-alloc-${s.step}`}>
+            <div className="alloc-step-head">
+              <span className="alloc-step-num">{s.step}</span>
+              <span className="step-label">{s.label}</span>
+              {s.value != null ? (
+                <span className={`step-value ${s.value < 0 ? "neg" : ""}`}>{val(s.value)}</span>
+              ) : null}
+            </div>
+            {s.detail ? <div className="step-detail">{s.detail}</div> : null}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
 function SpreadsheetDetailBlock({ metric }: { metric: MetricWorkings }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(!!metric.isActual);
   const detail = metric.spreadsheet;
   if (!detail) return null;
 
@@ -26,6 +51,9 @@ function SpreadsheetDetailBlock({ metric }: { metric: MetricWorkings }) {
       </button>
       {open ? (
         <div className="ss-body">
+          {detail.allocationSteps && detail.allocationSteps.length > 0 && !metric.allocationSteps?.length ? (
+            <AllocationTrail metric={metric} />
+          ) : null}
           <div className="ss-block">
             <div className="ss-label">Excel formula</div>
             <pre className="ss-formula">{detail.excelFormula}</pre>
@@ -75,14 +103,16 @@ function SpreadsheetDetailBlock({ metric }: { metric: MetricWorkings }) {
                 <thead>
                   <tr>
                     <th>Brand</th>
+                    <th>Type</th>
                     <th>Key</th>
                     <th>Amount</th>
                   </tr>
                 </thead>
                 <tbody>
                   {detail.brandBreakdown.map((b) => (
-                    <tr key={b.key}>
+                    <tr key={b.key} className={b.kind === "rollup" ? "brand-rollup" : undefined}>
                       <td>{b.brand}</td>
+                      <td>{b.kind === "rollup" ? "Rollup" : "Leaf"}</td>
                       <td className="key-cell">
                         <code>{b.key}</code>
                       </td>
@@ -90,10 +120,14 @@ function SpreadsheetDetailBlock({ metric }: { metric: MetricWorkings }) {
                     </tr>
                   ))}
                   <tr className="monthly-total">
-                    <td colSpan={2}>Sum of brands</td>
+                    <td colSpan={3}>
+                      Sum shown (All Brand key is authoritative when filter = All Brand)
+                    </td>
                     <td>
                       {fmtNumber(
-                        detail.brandBreakdown.reduce((s, b) => s + b.value, 0),
+                        detail.brandBreakdown
+                          .filter((b) => b.brand !== "All Brand")
+                          .reduce((s, b) => s + b.value, 0),
                         2,
                       )}
                     </td>
@@ -110,7 +144,7 @@ function SpreadsheetDetailBlock({ metric }: { metric: MetricWorkings }) {
 
 function MetricCard({ metric }: { metric: MetricWorkings }) {
   return (
-    <section className="workings-card">
+    <section className={`workings-card ${metric.isActual ? "actual-card" : ""}`}>
       <header>
         <strong>{metric.title}</strong>
         <span className={metric.result != null && metric.result < 0 ? "neg" : undefined}>
@@ -127,17 +161,20 @@ function MetricCard({ metric }: { metric: MetricWorkings }) {
           Key: <code>{metric.key}</code>
         </div>
       ) : null}
-      <ul>
-        {metric.steps.map((s, i) => (
-          <li key={`${metric.title}-${i}`}>
-            <span className="step-label">{s.label}</span>
-            {s.detail ? <span className="step-detail">{s.detail}</span> : null}
-            {s.value != null ? (
-              <span className={`step-value ${s.value < 0 ? "neg" : ""}`}>{val(s.value)}</span>
-            ) : null}
-          </li>
-        ))}
-      </ul>
+      {metric.isActual ? <AllocationTrail metric={metric} /> : null}
+      {!metric.isActual || !metric.allocationSteps?.length ? (
+        <ul>
+          {metric.steps.map((s, i) => (
+            <li key={`${metric.title}-${i}`}>
+              <span className="step-label">{s.label}</span>
+              {s.detail ? <span className="step-detail">{s.detail}</span> : null}
+              {s.value != null ? (
+                <span className={`step-value ${s.value < 0 ? "neg" : ""}`}>{val(s.value)}</span>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
       {metric.monthly && metric.monthly.length > 0 ? (
         <table className="monthly-table">
           <thead>
@@ -179,6 +216,8 @@ export function WorkingsPanel({ workings, onClose }: Props) {
   const ytdActual = monthlyActuals.filter((m) => m.inYtd).reduce((s, m) => s + m.actual, 0);
   const ytdLy = monthlyActuals.filter((m) => m.inYtd).reduce((s, m) => s + m.ly, 0);
   const ytdBudget = monthlyActuals.filter((m) => m.inYtd).reduce((s, m) => s + m.budget, 0);
+  const actualMetrics = workings.metrics.filter((m) => m.isActual);
+  const otherMetrics = workings.metrics.filter((m) => !m.isActual);
 
   return (
     <aside className="workings">
@@ -255,8 +294,18 @@ export function WorkingsPanel({ workings, onClose }: Props) {
         </table>
       </section>
 
+      {actualMetrics.length > 0 ? (
+        <div className="workings-metrics">
+          <h3 className="workings-section-title">Actuals — spreadsheet allocation &amp; steps</h3>
+          {actualMetrics.map((m) => (
+            <MetricCard key={m.title} metric={m} />
+          ))}
+        </div>
+      ) : null}
+
       <div className="workings-metrics">
-        {workings.metrics.map((m) => (
+        <h3 className="workings-section-title">LY / Budget workings</h3>
+        {otherMetrics.map((m) => (
           <MetricCard key={m.title} metric={m} />
         ))}
       </div>

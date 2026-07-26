@@ -48,6 +48,15 @@ export type BrandBreak = {
   brand: string;
   key: string;
   value: number;
+  /** rollup = TTK/Kobayashi/All Brand; leaf = named brand */
+  kind?: "rollup" | "leaf";
+};
+
+export type AllocationStep = {
+  step: number;
+  label: string;
+  detail?: string;
+  value?: number | null;
 };
 
 export type SpreadsheetDetail = {
@@ -59,6 +68,8 @@ export type SpreadsheetDetail = {
   notes?: string[];
   /** When filter brand is All Brand, show brand-level Working keys that roll up */
   brandBreakdown?: BrandBreak[];
+  /** Numbered allocation / lookup steps for Actuals */
+  allocationSteps?: AllocationStep[];
 };
 
 export type MetricWorkings = {
@@ -69,6 +80,10 @@ export type MetricWorkings = {
   steps: WorkingStep[];
   monthly?: MonthlyBreak[];
   spreadsheet?: SpreadsheetDetail;
+  /** True for Actual MTD/YTD cards — UI expands allocation trail */
+  isActual?: boolean;
+  /** Always-visible Actuals build-up steps */
+  allocationSteps?: AllocationStep[];
 };
 
 export type RowWorkings = {
@@ -186,6 +201,7 @@ function workingBrandBreakdown(
   month: Month,
   year: number,
   sign: number,
+  includeAllBrand = false,
 ): BrandBreak[] {
   const prefix = `${account}${channel}`;
   const suffix = `${month}${year}`;
@@ -193,11 +209,141 @@ function workingBrandBreakdown(
   for (const [key, amount] of data.working) {
     if (!key.startsWith(prefix) || !key.endsWith(suffix)) continue;
     const brand = key.slice(prefix.length, key.length - suffix.length);
-    if (!brand || brand === "All Brand") continue;
-    out.push({ brand, key, value: sign * amount });
+    if (!brand) continue;
+    if (!includeAllBrand && brand === "All Brand") continue;
+    const kind: "rollup" | "leaf" =
+      brand === "All Brand" || brand === "TTK" || brand === "Kobayashi" ? "rollup" : "leaf";
+    out.push({ brand, key, value: sign * amount, kind });
   }
-  out.sort((a, b) => Math.abs(b.value) - Math.abs(a.value));
+  out.sort((a, b) => {
+    const rank = (k?: string) => (k === "rollup" ? 0 : 1);
+    const dr = rank(a.kind) - rank(b.kind);
+    if (dr !== 0) return dr;
+    return Math.abs(b.value) - Math.abs(a.value);
+  });
   return out;
+}
+
+/** Build numbered Actuals trail from Working(Local) (post-allocation stored amounts). */
+function buildWorkingActualTrail(
+  data: WorkbookData,
+  account: string,
+  channel: string,
+  brand: string,
+  month: Month,
+  year: number,
+  key: string,
+  stored: number,
+  result: number,
+  flipSign: boolean,
+  isYtd: boolean,
+): { allocationSteps: AllocationStep[]; brandBreakdown: BrandBreak[] } {
+  const brandBreak = workingBrandBreakdown(data, account, channel, month, year, flipSign ? -1 : 1, true);
+  const allBrand = brandBreak.find((b) => b.brand === "All Brand");
+  const ttk = brandBreak.find((b) => b.brand === "TTK");
+  const kby = brandBreak.find((b) => b.brand === "Kobayashi");
+  const leaves = brandBreak.filter((b) => b.kind === "leaf");
+  const leafSum = leaves.reduce((s, b) => s + b.value, 0);
+  const rollupSum = (ttk?.value ?? 0) + (kby?.value ?? 0);
+
+  const allocationSteps: AllocationStep[] = [
+    {
+      step: 1,
+      label: "Source spreadsheet",
+      detail:
+        "Working(Local) Raw table — amounts are already post-allocation (native customer booking + blank-customer / pool fan-out done upstream before load).",
+    },
+    {
+      step: 2,
+      label: "Build VLOOKUP key",
+      detail: `Account & Channel & Brand & Month & Year → ${key}`,
+    },
+    {
+      step: 3,
+      label: isYtd ? `Sum monthly Working keys Jan → ${month}` : "Look up Amount (column E)",
+      detail: isYtd
+        ? `For each month m in Jan…${month}: VLOOKUP(Account&Channel&Brand&m&${year}, Working(Local)!$A:$E, 5, 0)`
+        : `=IFERROR(VLOOKUP("${key}", 'Working(Local)'!$A:$E, 5, FALSE), 0)`,
+      value: stored,
+    },
+  ];
+
+  if (flipSign) {
+    allocationSteps.push({
+      step: allocationSteps.length + 1,
+      label: "Apply Local P&L sign convention",
+      detail: "Revenue is stored negative in Working(Local); GSV Actual = −Revenue",
+      value: result,
+    });
+  } else {
+    allocationSteps.push({
+      step: allocationSteps.length + 1,
+      label: "Amount used on Local P&L Actual",
+      detail: `Column K (CY ${year}) for selected Month / Channel / Brand`,
+      value: result,
+    });
+  }
+
+  if (brand === "All Brand" || brandBreak.length > 1) {
+    allocationSteps.push({
+      step: allocationSteps.length + 1,
+      label: "Brand allocation view (same account / channel / month)",
+      detail: [
+        allBrand != null ? `All Brand stored = ${fmt(allBrand.value)}` : null,
+        ttk != null || kby != null
+          ? `TTK + Kobayashi = ${fmt(ttk?.value ?? 0)} + ${fmt(kby?.value ?? 0)} = ${fmt(rollupSum)}`
+          : null,
+        leaves.length
+          ? `Sum of ${leaves.length} leaf brands = ${fmt(leafSum)} (do not add leaves on top of TTK — TTK already rolls them up)`
+          : null,
+        allBrand != null && Math.abs(allBrand.value - rollupSum) > 0.05
+          ? `Note: All Brand (${fmt(allBrand.value)}) ≠ TTK+Kobayashi (${fmt(rollupSum)}) by ${fmt(allBrand.value - rollupSum)} — use the All Brand key for “All Brand” filter, not a re-sum of leaves.`
+          : null,
+      ]
+        .filter(Boolean)
+        .join(" · "),
+      value: allBrand?.value ?? result,
+    });
+  }
+
+  // Related Working accounts that often explain the same Actual (allocation components)
+  const related: { account: string; label: string }[] = [];
+  if (account === "Indirect COGS-SC" || account === "Indirect COGS-MK") {
+    related.push(
+      { account: "Indirect COGS-MK", label: "Indirect COGS-MK" },
+      { account: "Indirect COGS-SC", label: "Indirect COGS-SC" },
+    );
+  } else if (account === "Cost of Sales - Direct") {
+    related.push(
+      { account: "Cost of Sales - Direct", label: "Direct" },
+      { account: "Indirect COGS-MK", label: "Indirect COGS-MK" },
+      { account: "Indirect COGS-SC", label: "Indirect COGS-SC" },
+    );
+  }
+
+  if (related.length) {
+    const parts = related.map((r) => {
+      const k = workingKey(r.account, channel, brand, month, year);
+      const amt = data.working.get(k) ?? 0;
+      return { label: r.label, key: k, amount: amt };
+    });
+    const sum = parts.reduce((s, p) => s + p.amount, 0);
+    allocationSteps.push({
+      step: allocationSteps.length + 1,
+      label: "Related Working accounts (same Channel / Brand / Month)",
+      detail: parts.map((p) => `${p.label} = ${fmt(p.amount)}`).join(" · ") + ` · combined ${fmt(sum)}`,
+      value: sum,
+    });
+  }
+
+  allocationSteps.push({
+    step: allocationSteps.length + 1,
+    label: "What this file does / does not show",
+    detail:
+      "Customer Brand PL Working(Local) stores the final allocated Actual. Upstream allocation math (native booking + blank-customer SC/MK pools × sales %) lives in the Trivision / CombinedPL engine — compare that export in Customer comparison when you need pre-allocation steps.",
+  });
+
+  return { allocationSteps, brandBreakdown: brandBreak };
 }
 
 function sellSpreadsheet(
@@ -274,9 +420,12 @@ function workingSpreadsheet(
   isYtd: boolean,
   flipSign: boolean,
   brandBreakdown?: BrandBreak[],
+  allocationSteps?: AllocationStep[],
 ): SpreadsheetDetail {
   const yearCell = year === LY ? "I$10" : "K$10";
   const col = year === LY ? "I" : "K";
+  const rollups = brandBreakdown?.filter((b) => b.kind === "rollup") ?? [];
+  const leaves = brandBreakdown?.filter((b) => b.kind === "leaf") ?? [];
   return {
     excelFormula: isYtd
       ? `=IF(T$9="YTD ${month}", SUM(VLOOKUP(account&channel&brand&eachMonth&year,'Working(Local)'!$A:$G,5,0) for Jan→${month}), …)`
@@ -296,11 +445,15 @@ function workingSpreadsheet(
       `VLOOKUP returns column E (Amount) from Working(Local) Raw table`,
       `Local P&L ${col} column uses year ${year}`,
       ...(flipSign ? ["Revenue is stored negative in Working; Local P&L flips sign for GSV"] : []),
-      ...(brand === "All Brand" && brandBreakdown && brandBreakdown.length
-        ? [`All Brand aggregate can be reviewed as sum of ${brandBreakdown.length} brand keys below`]
+      ...(rollups.length
+        ? [`Rollup brands in Working: ${rollups.map((b) => `${b.brand}=${fmt(b.value)}`).join(", ")}`]
+        : []),
+      ...(leaves.length
+        ? [`${leaves.length} leaf brand keys available below (TTK already includes its leaves)`]
         : []),
     ],
     brandBreakdown,
+    allocationSteps,
   };
 }
 
@@ -378,21 +531,61 @@ function explainSell(
       result: mtdFrom(maps.cy, key, month),
       source: maps.cySheet,
       key,
+      isActual: true,
+      allocationSteps: [
+        {
+          step: 1,
+          label: "Source spreadsheet",
+          detail: `${maps.cySheet} — Sell Actuals (2026), not Working(Local)`,
+        },
+        {
+          step: 2,
+          label: "Build lookup key",
+          detail: `Channel & Brand & "${ttkKby}" → ${key}`,
+        },
+        {
+          step: 3,
+          label: `Take ${month} column amount`,
+          detail: `=VLOOKUP("${key}", '${maps.cySheet}', ${month} column, FALSE)`,
+          value: mtdFrom(maps.cy, key, month),
+        },
+        {
+          step: 4,
+          label: "Local P&L Actual",
+          detail: "Posted to MTD Actual for this Sell line",
+          value: mtdFrom(maps.cy, key, month),
+        },
+      ],
       steps: [
         { label: "Lookup key", detail: key },
         { label: "Column", detail: month },
         { label: "Result", value: mtdFrom(maps.cy, key, month) },
       ],
-      spreadsheet: sellSpreadsheet(
-        maps.cySheet,
-        key,
-        filters.channel,
-        filters.brand,
-        ttkKby,
-        month,
-        "Actual sell sheets use 2026 monthly columns",
-        false,
-      ),
+      spreadsheet: {
+        ...sellSpreadsheet(
+          maps.cySheet,
+          key,
+          filters.channel,
+          filters.brand,
+          ttkKby,
+          month,
+          "Actual sell sheets use 2026 monthly columns",
+          false,
+        ),
+        allocationSteps: [
+          {
+            step: 1,
+            label: "Source spreadsheet",
+            detail: maps.cySheet,
+          },
+          {
+            step: 2,
+            label: "Key",
+            detail: key,
+            value: mtdFrom(maps.cy, key, month),
+          },
+        ],
+      },
     },
     {
       title: "YTD · LY",
@@ -439,6 +632,20 @@ function explainSell(
       result: ytdFrom(maps.cy, key, month),
       source: maps.cySheet,
       key,
+      isActual: true,
+      allocationSteps: [
+        {
+          step: 1,
+          label: "Source spreadsheet",
+          detail: `${maps.cySheet} — Sell Actuals (2026)`,
+        },
+        {
+          step: 2,
+          label: "Sum Jan → selected month",
+          detail: `Key ${key} on columns Jan…${month}`,
+          value: ytdFrom(maps.cy, key, month),
+        },
+      ],
       steps: [
         { label: "Sum", detail: `Jan → ${month}` },
         { label: "Total", value: ytdFrom(maps.cy, key, month) },
@@ -478,9 +685,35 @@ function explainWorking(
   const lyRaw = data.working.get(lyKey) ?? 0;
   const cyRaw = data.working.get(cyKey) ?? 0;
   const brandBreakLy =
-    brand === "All Brand" ? workingBrandBreakdown(data, account, channel, month, LY, sign) : undefined;
-  const brandBreakCy =
-    brand === "All Brand" ? workingBrandBreakdown(data, account, channel, month, CY, sign) : undefined;
+    brand === "All Brand" ? workingBrandBreakdown(data, account, channel, month, LY, sign, true) : undefined;
+  const mtdActualTrail = buildWorkingActualTrail(
+    data,
+    account,
+    channel,
+    brand,
+    month,
+    CY,
+    cyKey,
+    cyRaw,
+    sign * cyRaw,
+    flipSign,
+    false,
+  );
+  const ytdActualMonths = workingMonthly(data, account, channel, brand, CY, month, sign);
+  const ytdActualResult = ytdActualMonths.reduce((s, x) => s + x.value, 0);
+  const ytdActualTrail = buildWorkingActualTrail(
+    data,
+    account,
+    channel,
+    brand,
+    month,
+    CY,
+    cyKey,
+    ytdActualMonths.reduce((s, x) => s + (data.working.get(workingKey(account, channel, brand, x.month, CY)) ?? 0), 0),
+    ytdActualResult,
+    flipSign,
+    true,
+  );
 
   return [
     {
@@ -524,10 +757,13 @@ function explainWorking(
       result: sign * cyRaw,
       source: "Working(Local)",
       key: cyKey,
-      steps: [
-        { label: "Stored amount", value: cyRaw },
-        ...(flipSign ? [{ label: "After sign flip", value: sign * cyRaw }] : []),
-      ],
+      isActual: true,
+      allocationSteps: mtdActualTrail.allocationSteps,
+      steps: mtdActualTrail.allocationSteps.map((s) => ({
+        label: `${s.step}. ${s.label}`,
+        detail: s.detail,
+        value: s.value,
+      })),
       spreadsheet: workingSpreadsheet(
         account,
         channel,
@@ -537,7 +773,8 @@ function explainWorking(
         cyKey,
         false,
         flipSign,
-        brandBreakCy,
+        mtdActualTrail.brandBreakdown,
+        mtdActualTrail.allocationSteps,
       ),
     },
     {
@@ -561,13 +798,31 @@ function explainWorking(
     },
     {
       title: "YTD · Actual",
-      result: workingMonthly(data, account, channel, brand, CY, month, sign).reduce((s, x) => s + x.value, 0),
+      result: ytdActualResult,
       source: "Working(Local)",
+      isActual: true,
+      allocationSteps: ytdActualTrail.allocationSteps,
       steps: [
-        { label: "Sum of monthly keys", detail: `Jan${CY} → ${month}${CY}` },
+        ...ytdActualTrail.allocationSteps.map((s) => ({
+          label: `${s.step}. ${s.label}`,
+          detail: s.detail,
+          value: s.value,
+        })),
+        { label: "Monthly Actuals in YTD", detail: `Jan${CY} → ${month}${CY}` },
       ],
-      monthly: workingMonthly(data, account, channel, brand, CY, month, sign),
-      spreadsheet: workingSpreadsheet(account, channel, brand, month, CY, cyKey, true, flipSign),
+      monthly: ytdActualMonths,
+      spreadsheet: workingSpreadsheet(
+        account,
+        channel,
+        brand,
+        month,
+        CY,
+        cyKey,
+        true,
+        flipSign,
+        ytdActualTrail.brandBreakdown,
+        ytdActualTrail.allocationSteps,
+      ),
     },
   ];
 }
@@ -598,9 +853,35 @@ function formulaMetrics(
         return `${sign}${fmt(v)}`;
       })
       .join(" ");
+
+    const isActual = field === "actual";
+    const allocationSteps: AllocationStep[] | undefined = isActual
+      ? [
+          {
+            step: 1,
+            label: "Derived Actual (not a single Working key)",
+            detail: `Local P&L computes this Actual from component rows: ${expression}`,
+          },
+          ...parts.map((p, i) => ({
+            step: i + 2,
+            label: `${p.op === "-" ? "Subtract" : "Add"} ${p.label}`,
+            detail: `Use ${period.toUpperCase()} Actual of row “${p.label}” (see that line’s Workings for Working(Local) allocation)`,
+            value: pick(report, p.id, period, field),
+          })),
+          {
+            step: parts.length + 2,
+            label: "Resulting Actual",
+            detail: `=${resolved}`,
+            value: result,
+          },
+        ]
+      : undefined;
+
     return {
       title: `${period.toUpperCase()} · ${field === "ly" ? "LY" : field === "budget" ? "Budget" : "Actual"}`,
       result,
+      isActual,
+      allocationSteps,
       steps: [
         { label: "Formula", detail: expression },
         ...steps,
@@ -612,12 +893,16 @@ function formulaMetrics(
         notes: [
           "Derived on Local P&L from other rows (not a direct Working/Budget lookup)",
           `Period: ${period.toUpperCase()} · ${field === "ly" ? "LY" : field === "budget" ? "Budget" : "Actual"}`,
+          ...(isActual
+            ? ["Open each component line’s Workings to see Working(Local) key / brand allocation for that Actual."]
+            : []),
         ],
         keyParts: parts.map((p) => ({
           cell: p.id,
           part: p.label,
           value: fmt(pick(report, p.id, period, field)),
         })),
+        allocationSteps,
       },
     };
   };
@@ -1146,6 +1431,40 @@ export function buildRowWorkings(
   const { indexes, ratios } = indexAndRatioSteps(row);
   const monthlyActuals = buildMonthlyActuals(data, filters, rowId);
 
+  // Ensure every Actual card exposes an allocation / build-up trail for the UI
+  const decoratedMetrics = metrics.map((m) => {
+    if (!/actual/i.test(m.title)) return m;
+    if (m.allocationSteps?.length) return { ...m, isActual: true };
+    const allocationSteps: AllocationStep[] = [
+      {
+        step: 1,
+        label: "Actual build-up",
+        detail: m.source
+          ? `Source sheet: ${m.source}${m.key ? ` · key ${m.key}` : ""}`
+          : "Derived from component P&L Actuals / Working(Local) lookups",
+        value: m.result,
+      },
+      ...m.steps.map((s, i) => ({
+        step: i + 2,
+        label: s.label,
+        detail: s.detail,
+        value: s.value,
+      })),
+    ];
+    return {
+      ...m,
+      isActual: true,
+      allocationSteps,
+      spreadsheet: m.spreadsheet
+        ? { ...m.spreadsheet, allocationSteps: m.spreadsheet.allocationSteps ?? allocationSteps }
+        : {
+            excelFormula: "(see steps)",
+            excelFormulaResolved: `Actual = ${fmt(m.result)}`,
+            allocationSteps,
+          },
+    };
+  });
+
   return {
     rowId,
     label: row.label,
@@ -1155,7 +1474,7 @@ export function buildRowWorkings(
     channelMapped,
     method,
     monthlyActuals,
-    metrics,
+    metrics: decoratedMetrics,
     indexes,
     ratios,
   };

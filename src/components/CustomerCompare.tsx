@@ -3,10 +3,14 @@ import * as XLSX from "xlsx";
 import {
   buildCustomerCompare,
   emptyActualsInput,
+  fillDerivedInput,
   inputtableLineCount,
+  isTrivisionMapperSheet,
   parseActualsRows,
   parseActualsText,
   parseComparativeSheet,
+  parseTrivisionMapperSheet,
+  resolveCustomerChannel,
   seedInputFromPl,
   type ActualsInput,
 } from "../engine/compare";
@@ -71,11 +75,39 @@ export function CustomerCompare({ data, channels, brands, initialFilters }: Prop
     );
   }
 
+  function applyTrivisionInput(
+    parsed: {
+      input: ActualsInput;
+      matched: number;
+      unmatched: string[];
+      detectedCustomer: string | null;
+      sourceLabel: string;
+    },
+    fileName: string,
+    formatNote: string,
+  ) {
+    setInput(fillDerivedInput({ ...emptyActualsInput(), ...parsed.input }));
+    setSourceLabel(parsed.sourceLabel || fileName);
+    const channel = resolveCustomerChannel(parsed.detectedCustomer, channels);
+    if (channel) {
+      setFilters((f) => ({ ...f, channel }));
+    }
+    const custNote = channel
+      ? ` · customer ${channel}`
+      : parsed.detectedCustomer
+        ? ` · customer “${parsed.detectedCustomer}” (not matched — pick Channel)`
+        : "";
+    setStatus(
+      parsed.unmatched.length
+        ? `Loaded ${parsed.matched} from ${fileName}${custNote} · ${parsed.unmatched.length} unmatched`
+        : `Loaded ${parsed.matched} lines from ${fileName}${custNote} · ${formatNote}`,
+    );
+  }
+
   async function onUploadActuals(file: File) {
     try {
       const buf = await file.arrayBuffer();
       const wb = XLSX.read(buf, { type: "array" });
-      // Prefer Comparitive Analysis sheet when present
       const sheetName =
         wb.SheetNames.find((n) => /compar/i.test(n)) ?? wb.SheetNames[0]!;
       const sheet = wb.Sheets[sheetName];
@@ -85,7 +117,13 @@ export function CustomerCompare({ data, channels, brands, initialFilters }: Prop
         raw: true,
       });
 
-      // Detect Comparative Analysis layout (header with Trivision / P&L line items)
+      // Trivision / P&L Mapper (dtck.xlsx): Label | base/calculated | brand | customer | amount
+      if (isTrivisionMapperSheet(rows)) {
+        applyTrivisionInput(parseTrivisionMapperSheet(rows), file.name, "Trivision P&L");
+        return;
+      }
+
+      // ComparitiveAnalysis.xlsx layout
       const looksComparative = rows.some((r) => {
         const a = String(r?.[0] ?? "");
         const b = String(r?.[1] ?? "");
@@ -94,16 +132,7 @@ export function CustomerCompare({ data, channels, brands, initialFilters }: Prop
 
       if (looksComparative) {
         const parsed = parseComparativeSheet(rows, filters.channel);
-        setInput((prev) => ({ ...prev, ...parsed.input }));
-        setSourceLabel(parsed.sourceLabel || file.name);
-        if (parsed.detectedCustomer && channels.includes(parsed.detectedCustomer)) {
-          setFilters((f) => ({ ...f, channel: parsed.detectedCustomer! }));
-        }
-        setStatus(
-          parsed.unmatched.length
-            ? `Loaded ${parsed.matched} from ${file.name} (${sheetName}) · ${parsed.unmatched.length} unmatched`
-            : `Loaded ${parsed.matched} lines from ${file.name} · format: Comparitive Analysis`,
-        );
+        applyTrivisionInput(parsed, file.name, "Comparitive Analysis");
         return;
       }
 
@@ -118,7 +147,7 @@ export function CustomerCompare({ data, channels, brands, initialFilters }: Prop
         parsedRows.push({ label, amount });
       }
       const { input: next, matched, unmatched } = parseActualsRows(parsedRows);
-      setInput((prev) => ({ ...prev, ...next }));
+      setInput(fillDerivedInput({ ...emptyActualsInput(), ...next }));
       setSourceLabel(file.name);
       setStatus(
         unmatched.length
@@ -138,8 +167,8 @@ export function CustomerCompare({ data, channels, brands, initialFilters }: Prop
         <div className="compare-title">
           <h2>Customer comparison</h2>
           <p>
-            Same layout as ComparitiveAnalysis.xlsx: enter external Actuals (Trivision / 26 July
-            report) and compare to Customer Brand P&amp;L Actual for the selected customer.
+            Upload a Trivision P&amp;L export (e.g. dtck.xlsx) or ComparitiveAnalysis.xlsx, then
+            compare line-by-line to Customer Brand Local P&amp;L Actuals for that customer.
           </p>
         </div>
 
@@ -189,7 +218,7 @@ export function CustomerCompare({ data, channels, brands, initialFilters }: Prop
       <div className="compare-input-panel">
         <div className="compare-input-actions">
           <label className="btn-secondary file-btn">
-            Upload Actuals / ComparitiveAnalysis.xlsx
+            Upload Trivision P&amp;L (e.g. dtck.xlsx)
             <input
               type="file"
               accept=".xlsx,.xlsm,.csv"

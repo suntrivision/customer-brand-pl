@@ -448,6 +448,71 @@ body {
   color: var(--neg);
 }
 
+.workings-section-title {
+  margin: 4px 0 8px;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--mtd);
+  font-weight: 700;
+}
+
+.workings-card.actual-card {
+  border-color: #9ecfcf;
+  background: linear-gradient(180deg, #f4fbfb, #ffffff);
+}
+
+.alloc-trail {
+  margin: 8px 0 10px;
+  padding: 10px;
+  background: #eef7f7;
+  border: 1px solid #c5dedd;
+}
+
+.alloc-steps {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 8px;
+}
+
+.alloc-steps li {
+  display: grid;
+  gap: 3px;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed #c9dbdb;
+}
+
+.alloc-steps li:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.alloc-step-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.alloc-step-num {
+  flex: 0 0 auto;
+  width: 1.4rem;
+  height: 1.4rem;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--mtd);
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.brand-rollup td {
+  font-weight: 600;
+  background: #f3f8f8;
+}
+
 .ss-detail {
   margin-top: 10px;
   border-top: 1px dashed #d5dde6;
