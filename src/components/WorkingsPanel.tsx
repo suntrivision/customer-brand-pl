@@ -1,10 +1,14 @@
 import { useState } from "react";
-import type { MetricWorkings, RowWorkings } from "../engine/workings";
+import type { MetricWorkings, PreAllocationDetail, RowWorkings } from "../engine/workings";
 import { fmtNumber } from "./format";
 
 type Props = {
   workings: RowWorkings | null;
   onClose: () => void;
+  auditFileName?: string | null;
+  onUploadAudit?: (file: File) => void;
+  onClearAudit?: () => void;
+  auditStatus?: string | null;
 };
 
 function val(v: number | null | undefined): string {
@@ -23,7 +27,7 @@ function AllocationTrail({ metric }: { metric: MetricWorkings }) {
       <div className="ss-label">Actuals allocation / steps</div>
       <ol className="alloc-steps">
         {steps.map((s) => (
-          <li key={`${metric.title}-alloc-${s.step}`}>
+          <li key={`${metric.title}-alloc-${s.step}-${s.label}`}>
             <div className="alloc-step-head">
               <span className="alloc-step-num">{s.step}</span>
               <span className="step-label">{s.label}</span>
@@ -39,6 +43,125 @@ function AllocationTrail({ metric }: { metric: MetricWorkings }) {
   );
 }
 
+function PreAllocationBlock({
+  pre,
+  auditFileName,
+  onUploadAudit,
+  onClearAudit,
+  auditStatus,
+}: {
+  pre: PreAllocationDetail;
+  auditFileName?: string | null;
+  onUploadAudit?: (file: File) => void;
+  onClearAudit?: () => void;
+  auditStatus?: string | null;
+}) {
+  return (
+    <section className="workings-card pre-alloc-card">
+      <header>
+        <strong>Prior to allocation</strong>
+        <span className="muted-tiny">Native GL → pool fan-out → Post</span>
+      </header>
+
+      {onUploadAudit ? (
+        <div className="audit-upload-row">
+          <label className="btn-secondary file-btn">
+            Upload Allocation Audit .xlsx
+            <input
+              type="file"
+              accept=".xlsx,.xlsm"
+              hidden
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) onUploadAudit(f);
+                e.target.value = "";
+              }}
+            />
+          </label>
+          {auditFileName ? (
+            <>
+              <span className="muted-tiny">{auditFileName}</span>
+              {onClearAudit ? (
+                <button type="button" className="btn-secondary" onClick={onClearAudit}>
+                  Clear
+                </button>
+              ) : null}
+            </>
+          ) : null}
+        </div>
+      ) : null}
+      {auditStatus ? <p className="compare-status">{auditStatus}</p> : null}
+
+      {pre.available ? (
+        <>
+          <p className="step-detail">
+            {pre.sourceFile} · {pre.customerCode} · {pre.period}
+            {pre.grouping ? ` · ${pre.grouping}` : ""}
+          </p>
+          <ol className="alloc-steps">
+            {pre.steps.map((s) => (
+              <li key={`pre-${s.step}-${s.label}`}>
+                <div className="alloc-step-head">
+                  <span className="alloc-step-num">{s.step}</span>
+                  <span className="step-label">{s.label}</span>
+                  {s.value != null ? (
+                    <span className={`step-value ${s.value < 0 ? "neg" : ""}`}>{val(s.value)}</span>
+                  ) : null}
+                </div>
+                {s.detail ? <div className="step-detail">{s.detail}</div> : null}
+              </li>
+            ))}
+          </ol>
+          {pre.nativeGlRows.length > 0 ? (
+            <div className="ss-block" style={{ marginTop: 10 }}>
+              <div className="ss-label">Native Pre GL by brand (before pool allocation)</div>
+              <table className="monthly-table">
+                <thead>
+                  <tr>
+                    <th>Brand</th>
+                    <th>CC</th>
+                    <th>Pre</th>
+                    <th>Post</th>
+                    <th>Delta</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pre.nativeGlRows.map((r) => (
+                    <tr key={`${r.brand}-${r.costCenter}-${r.pre}`}>
+                      <td>{r.brand}</td>
+                      <td>{r.costCenter}</td>
+                      <td className={r.pre < 0 ? "neg" : undefined}>{fmtNumber(r.pre, 2)}</td>
+                      <td className={r.post < 0 ? "neg" : undefined}>{fmtNumber(r.post, 2)}</td>
+                      <td className={r.delta < 0 ? "neg" : undefined}>{fmtNumber(r.delta, 2)}</td>
+                    </tr>
+                  ))}
+                  <tr className="monthly-total">
+                    <td colSpan={2}>Native Pre total</td>
+                    <td>
+                      {fmtNumber(
+                        pre.nativeGlRows.reduce((s, r) => s + r.pre, 0),
+                        2,
+                      )}
+                    </td>
+                    <td colSpan={2} />
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+          {pre.rule ? (
+            <p className="step-detail" style={{ marginTop: 8 }}>
+              Rule {pre.rule.ruleId}: {pre.rule.ruleName} ({pre.rule.driver})
+            </p>
+          ) : null}
+        </>
+      ) : (
+        <p className="step-detail">{pre.reason}</p>
+      )}
+    </section>
+  );
+}
+
 function SpreadsheetDetailBlock({ metric }: { metric: MetricWorkings }) {
   const [open, setOpen] = useState(!!metric.isActual);
   const detail = metric.spreadsheet;
@@ -51,9 +174,6 @@ function SpreadsheetDetailBlock({ metric }: { metric: MetricWorkings }) {
       </button>
       {open ? (
         <div className="ss-body">
-          {detail.allocationSteps && detail.allocationSteps.length > 0 && !metric.allocationSteps?.length ? (
-            <AllocationTrail metric={metric} />
-          ) : null}
           <div className="ss-block">
             <div className="ss-label">Excel formula</div>
             <pre className="ss-formula">{detail.excelFormula}</pre>
@@ -202,12 +322,35 @@ function MetricCard({ metric }: { metric: MetricWorkings }) {
   );
 }
 
-export function WorkingsPanel({ workings, onClose }: Props) {
+export function WorkingsPanel({
+  workings,
+  onClose,
+  auditFileName,
+  onUploadAudit,
+  onClearAudit,
+  auditStatus,
+}: Props) {
   if (!workings) {
     return (
       <aside className="workings empty">
         <h2>Workings</h2>
         <p>Click any P&amp;L line to see how LY / Budget / Actual were calculated.</p>
+        {onUploadAudit ? (
+          <div className="audit-upload-row" style={{ marginTop: 12 }}>
+            <label className="btn-secondary file-btn">
+              Upload Allocation Audit .xlsx
+              <input
+                type="file"
+                accept=".xlsx,.xlsm"
+                hidden
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) onUploadAudit(f);
+                }}
+              />
+            </label>
+          </div>
+        ) : null}
       </aside>
     );
   }
@@ -250,6 +393,14 @@ export function WorkingsPanel({ workings, onClose }: Props) {
       </div>
 
       <p className="workings-method">{workings.method}</p>
+
+      <PreAllocationBlock
+        pre={workings.preAllocation}
+        auditFileName={auditFileName}
+        onUploadAudit={onUploadAudit}
+        onClearAudit={onClearAudit}
+        auditStatus={auditStatus}
+      />
 
       <section className="workings-card monthly-actuals-card">
         <header>

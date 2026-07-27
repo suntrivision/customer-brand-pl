@@ -4,6 +4,10 @@ import { FileUpload } from "./components/FileUpload";
 import { FilterBar } from "./components/FilterBar";
 import { PLTable } from "./components/PLTable";
 import { WorkingsPanel } from "./components/WorkingsPanel";
+import {
+  parseAllocationAudit,
+  type AllocationAuditData,
+} from "./engine/allocationAudit";
 import { computePL, withMonthlyActuals } from "./engine/computePL";
 import { parseWorkbook } from "./engine/parseWorkbook";
 import { buildRowWorkings } from "./engine/workings";
@@ -26,6 +30,9 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>("gsv");
   const [view, setView] = useState<AppView>("pl");
+  const [audit, setAudit] = useState<AllocationAuditData | null>(null);
+  const [auditFileName, setAuditFileName] = useState<string | null>(null);
+  const [auditStatus, setAuditStatus] = useState<string | null>(null);
 
   const report = useMemo(() => {
     if (!data) return null;
@@ -35,8 +42,8 @@ export default function App() {
   const workings = useMemo(() => {
     if (!data || !report || !selectedId || view !== "pl") return null;
     const base = computePL(data, filters);
-    return buildRowWorkings(data, filters, base, selectedId);
-  }, [data, filters, report, selectedId, view]);
+    return buildRowWorkings(data, filters, base, selectedId, audit);
+  }, [data, filters, report, selectedId, view, audit]);
 
   async function handleFile(file: File) {
     setBusy(true);
@@ -69,6 +76,51 @@ export default function App() {
     setFilters(DEFAULT_FILTERS);
     setSelectedId(null);
     setView("pl");
+    setAudit(null);
+    setAuditFileName(null);
+    setAuditStatus(null);
+  }
+
+  async function handleAuditFile(file: File) {
+    try {
+      const buffer = await file.arrayBuffer();
+      const parsed = parseAllocationAudit(buffer, file.name);
+      setAudit(parsed);
+      setAuditFileName(file.name);
+      setAuditStatus(
+        `Loaded audit ${parsed.customerCode} · ${parsed.period}` +
+          (parsed.runId ? ` · run ${parsed.runId.slice(0, 8)}…` : ""),
+      );
+      // Align filters to audit customer/month when possible
+      const monthMap: Record<string, Filters["month"]> = {
+        "01": "Jan",
+        "02": "Feb",
+        "03": "Mar",
+        "04": "Apr",
+        "05": "May",
+        "06": "Jun",
+        "07": "Jul",
+        "08": "Aug",
+        "09": "Sep",
+        "10": "Oct",
+        "11": "Nov",
+        "12": "Dec",
+      };
+      const mm = parsed.period.slice(5, 7);
+      const month = monthMap[mm];
+      const codeToChannel: Record<string, string> = {
+        DTCH: "DIST-CHC",
+        DTCK: "DIST-CK DISTRIBUTORS",
+      };
+      const channel = codeToChannel[parsed.customerCode.toUpperCase()];
+      setFilters((f) => ({
+        ...f,
+        ...(month ? { month } : {}),
+        ...(channel && data?.channels.includes(channel) ? { channel } : {}),
+      }));
+    } catch (e) {
+      setAuditStatus(e instanceof Error ? e.message : "Failed to read allocation audit");
+    }
   }
 
   if (!data || !report) {
@@ -107,7 +159,18 @@ export default function App() {
       {view === "pl" ? (
         <div className="app-main">
           <PLTable report={report} selectedId={selectedId} onSelect={setSelectedId} />
-          <WorkingsPanel workings={workings} onClose={() => setSelectedId(null)} />
+          <WorkingsPanel
+            workings={workings}
+            onClose={() => setSelectedId(null)}
+            auditFileName={auditFileName}
+            auditStatus={auditStatus}
+            onUploadAudit={(f) => void handleAuditFile(f)}
+            onClearAudit={() => {
+              setAudit(null);
+              setAuditFileName(null);
+              setAuditStatus("Cleared allocation audit");
+            }}
+          />
         </div>
       ) : (
         <CustomerCompare

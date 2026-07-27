@@ -17,6 +17,15 @@ import {
   ytdFrom,
 } from "./lookup";
 import { computePL } from "./computePL";
+import {
+  buildPreAllocationDetail,
+  workingAccountForRowId,
+  type AllocationAuditData,
+  type AllocationStep,
+  type PreAllocationDetail,
+} from "./allocationAudit";
+
+export type { AllocationStep, PreAllocationDetail } from "./allocationAudit";
 
 export type WorkingStep = {
   label: string;
@@ -50,13 +59,6 @@ export type BrandBreak = {
   value: number;
   /** rollup = TTK/Kobayashi/All Brand; leaf = named brand */
   kind?: "rollup" | "leaf";
-};
-
-export type AllocationStep = {
-  step: number;
-  label: string;
-  detail?: string;
-  value?: number | null;
 };
 
 export type SpreadsheetDetail = {
@@ -99,6 +101,8 @@ export type RowWorkings = {
   metrics: MetricWorkings[];
   indexes: WorkingStep[];
   ratios: WorkingStep[];
+  /** Pre-allocation (native → pool → post) from Allocation Audit workbook */
+  preAllocation: PreAllocationDetail;
 };
 
 const LY = 2025;
@@ -981,6 +985,7 @@ export function buildRowWorkings(
   filters: Filters,
   report: PLReport,
   rowId: string,
+  audit?: AllocationAuditData | null,
 ): RowWorkings | null {
   const row = rowVal(report, rowId);
   if (!row) return null;
@@ -988,6 +993,12 @@ export function buildRowWorkings(
   const budgetChannel = mapBudgetChannel(data, filters.channel);
   const budgetBrand = filters.channel === "All Chain" ? filters.brand : "All Brand";
   const channelMapped = budgetChannel !== filters.channel;
+  const workingAccount = workingAccountForRowId(rowId);
+  const preAllocation = buildPreAllocationDetail(audit, {
+    channel: filters.channel,
+    month: filters.month,
+    account: workingAccount,
+  });
 
   let method = "";
   let metrics: MetricWorkings[] = [];
@@ -1434,29 +1445,48 @@ export function buildRowWorkings(
   // Ensure every Actual card exposes an allocation / build-up trail for the UI
   const decoratedMetrics = metrics.map((m) => {
     if (!/actual/i.test(m.title)) return m;
-    if (m.allocationSteps?.length) return { ...m, isActual: true };
-    const allocationSteps: AllocationStep[] = [
-      {
-        step: 1,
-        label: "Actual build-up",
-        detail: m.source
-          ? `Source sheet: ${m.source}${m.key ? ` · key ${m.key}` : ""}`
-          : "Derived from component P&L Actuals / Working(Local) lookups",
-        value: m.result,
-      },
-      ...m.steps.map((s, i) => ({
-        step: i + 2,
-        label: s.label,
-        detail: s.detail,
-        value: s.value,
-      })),
-    ];
+
+    let postSteps: AllocationStep[] = m.allocationSteps?.length
+      ? m.allocationSteps
+      : [
+          {
+            step: 1,
+            label: "Actual build-up",
+            detail: m.source
+              ? `Source sheet: ${m.source}${m.key ? ` · key ${m.key}` : ""}`
+              : "Derived from component P&L Actuals / Working(Local) lookups",
+            value: m.result,
+          },
+          ...m.steps.map((s, i) => ({
+            step: i + 2,
+            label: s.label,
+            detail: s.detail,
+            value: s.value,
+          })),
+        ];
+
+    // Prepend engine Pre → Post steps when Allocation Audit matches this customer/month/account
+    let allocationSteps = postSteps;
+    if (preAllocation.available && preAllocation.steps.length && /MTD/i.test(m.title)) {
+      const pre = preAllocation.steps;
+      const offset = pre.length;
+      allocationSteps = [
+        ...pre,
+        {
+          step: offset + 1,
+          label: "── After allocation: Customer Brand PL lookup ──",
+          detail: "Working(Local) / Sell sheets hold the Post amount used on Local P&L Actual",
+        },
+        ...postSteps.map((s) => ({ ...s, step: offset + 1 + s.step })),
+      ];
+    }
+
     return {
       ...m,
       isActual: true,
       allocationSteps,
       spreadsheet: m.spreadsheet
-        ? { ...m.spreadsheet, allocationSteps: m.spreadsheet.allocationSteps ?? allocationSteps }
+        ? { ...m.spreadsheet, allocationSteps }
         : {
             excelFormula: "(see steps)",
             excelFormulaResolved: `Actual = ${fmt(m.result)}`,
@@ -1477,5 +1507,6 @@ export function buildRowWorkings(
     metrics: decoratedMetrics,
     indexes,
     ratios,
+    preAllocation,
   };
 }

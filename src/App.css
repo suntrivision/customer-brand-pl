@@ -462,6 +462,19 @@ body {
   background: linear-gradient(180deg, #f4fbfb, #ffffff);
 }
 
+.workings-card.pre-alloc-card {
+  border-color: #d4b896;
+  background: linear-gradient(180deg, #fbf7f0, #ffffff);
+}
+
+.audit-upload-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
 .alloc-trail {
   margin: 8px 0 10px;
   padding: 10px;
